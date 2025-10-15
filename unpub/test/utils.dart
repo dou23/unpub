@@ -19,15 +19,16 @@ final email3 = 'email3@example.com';
 createServer(String opEmail) async {
   final db = Db('mongodb://localhost:27017/dart_pub_test');
   await db.open();
-  var mongoStore = unpub.MongoStore(db);
+  var dbStore = unpub.MongoStore(db);
+  // var dbStore = unpub.SqliteStore(path.absolute('unpub-packages'));
 
   var app = unpub.App(
-    metaStore: mongoStore,
+    metaStore: dbStore,
     packageStore: unpub.FileStore(baseDir),
     overrideUploaderEmail: opEmail,
   );
 
-  var server = await app.serve('0.0.0.0', 4000);
+  var server = await app.serve('0.0.0.0', 9090);
   return server;
 }
 

@@ -2,7 +2,9 @@ import 'package:json_annotation/json_annotation.dart';
 
 part 'models.g.dart';
 
-DateTime identity(DateTime x) => x;
+// 在 UnpubVersion 类中添加以下静态方法
+DateTime _dateTimeFromJson(String dateTime) => DateTime.parse(dateTime);
+String _dateTimeToJson(DateTime dateTime) => dateTime.toIso8601String();
 
 @JsonSerializable(includeIfNull: false)
 class UnpubVersion {
@@ -13,7 +15,7 @@ class UnpubVersion {
   final String? readme;
   final String? changelog;
 
-  @JsonKey(fromJson: identity, toJson: identity)
+  @JsonKey(fromJson: _dateTimeFromJson, toJson: _dateTimeToJson)
   final DateTime createdAt;
 
   UnpubVersion(
@@ -39,10 +41,10 @@ class UnpubPackage {
   final bool private;
   final List<String>? uploaders;
 
-  @JsonKey(fromJson: identity, toJson: identity)
+  @JsonKey(fromJson: _dateTimeFromJson, toJson: _dateTimeToJson)
   final DateTime createdAt;
 
-  @JsonKey(fromJson: identity, toJson: identity)
+  @JsonKey(fromJson: _dateTimeFromJson, toJson: _dateTimeToJson)
   final DateTime updatedAt;
 
   final int? download;

@@ -15,6 +15,7 @@ Unpub is a self-hosted private Dart Pub server for Enterprise, with a simple web
 ```sh
 pub global activate unpub
 unpub --database mongodb://localhost:27017/dart_pub # Replace this with production database uri
+unpub-linux.exe -p 12345 # -p指定12345端口启动
 ```
 
 Unpub use mongodb as meta information store and file system as package(tarball) store by default.

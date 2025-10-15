@@ -12,6 +12,7 @@ import 'package:shelf_cors_headers/shelf_cors_headers.dart';
 import 'package:shelf_router/shelf_router.dart';
 import 'package:pub_semver/pub_semver.dart' as semver;
 import 'package:archive/archive.dart';
+import 'package:unpub/src/file_store.dart';
 import 'package:unpub/src/models.dart';
 import 'package:unpub/unpub_api/lib/models.dart';
 import 'package:unpub/src/meta_store.dart';
@@ -22,6 +23,40 @@ import 'static/main.dart.js.dart' as main_dart_js;
 
 part 'app.g.dart';
 
+class CachedResponse {
+  final String body;
+  final Map<String, String> headers;
+  final int statusCode;
+  final DateTime cachedAt;
+  final Duration maxAge;
+
+  CachedResponse({
+    required this.body,
+    required this.headers,
+    this.statusCode = 200,
+    required this.cachedAt,
+    required this.maxAge,
+  });
+
+  bool get isExpired => DateTime.now().isAfter(cachedAt.add(maxAge));
+
+  Map<String, dynamic> toJson() => {
+        'body': body,
+        'headers': headers,
+        'statusCode': statusCode,
+        'cachedAt': cachedAt.toIso8601String(),
+        'maxAgeInSeconds': maxAge.inSeconds,
+      };
+
+  factory CachedResponse.fromJson(Map<String, dynamic> json) => CachedResponse(
+        body: json['body'] as String,
+        headers: Map<String, String>.from(json['headers'] as Map),
+        statusCode: json['statusCode'] as int,
+        cachedAt: DateTime.parse(json['cachedAt'] as String),
+        maxAge: Duration(seconds: json['maxAgeInSeconds'] as int),
+      );
+}
+
 class App {
   static const proxyOriginHeader = "proxy-origin";
 
@@ -31,7 +66,7 @@ class App {
   /// package(tarball) store
   final PackageStore packageStore;
 
-  /// upstream url, default: https://pub.dev
+  /// upstream url, default: https://pub.flutter-io.cn
   final String upstream;
 
   /// http(s) proxy to call googleapis (to get uploader email)
@@ -41,21 +76,33 @@ class App {
   /// A forward proxy uri
   final Uri? proxy_origin;
 
+  /// Cache directory for offline support
+  final Directory? cacheDirectory;
+
   /// validate if the package can be published
   ///
   /// for more details, see: https://github.com/bytedance/unpub#package-validator
   final Future<void> Function(
       Map<String, dynamic> pubspec, String uploaderEmail)? uploadValidator;
 
+  // In-memory cache for responses
+  final Map<String, CachedResponse> _responseCache = {};
+
   App({
     required this.metaStore,
     required this.packageStore,
-    this.upstream = 'https://pub.dev',
+    this.upstream = 'https://pub.dev/',
     this.googleapisProxy,
     this.overrideUploaderEmail,
     this.uploadValidator,
     this.proxy_origin,
-  });
+    this.cacheDirectory,
+  }) {
+    // Ensure cache directory exists if provided
+    if (cacheDirectory != null && !cacheDirectory!.existsSync()) {
+      cacheDirectory!.createSync(recursive: true);
+    }
+  }
 
   static shelf.Response _okWithJson(Map<String, dynamic> data) =>
       shelf.Response.ok(
@@ -135,7 +182,8 @@ class App {
     var name = item.pubspec['name'] as String;
     var version = item.version;
     return {
-      'archive_url': _resolveUrl(req, '/packages/$name/versions/$version.tar.gz'),
+      'archive_url':
+          _resolveUrl(req, '/packages/$name/versions/$version.tar.gz'),
       'pubspec': item.pubspec,
       'version': version,
     };
@@ -149,33 +197,254 @@ class App {
 
   Router get router => _$AppRouter(this);
 
-  @Route.get('/api/packages/<name>')
-  Future<shelf.Response> getVersions(shelf.Request req, String name) async {
-    var package = await metaStore.queryPackage(name);
+  // Cache helper methods
+  String _generateCacheKey(shelf.Request req) {
+    return '${req.method}:${req.requestedUri.path}?${req.requestedUri.query}';
+  }
 
-    if (package == null) {
-      return shelf.Response.found(
-          Uri.parse(upstream).resolve('/api/packages/$name').toString());
+  Future<void> _saveToCache(String key, shelf.Response response) async {
+    try {
+      // Read response body
+      final body = await response.readAsString();
+
+      // If cache directory is provided, use file system caching
+      if (cacheDirectory != null) {
+        final file = File('${cacheDirectory!.path}/$key.json');
+        final cachedResponse = CachedResponse(
+          body: body,
+          headers: response.headers,
+          statusCode: response.statusCode,
+          cachedAt: DateTime.now(),
+          maxAge: const Duration(hours: 1),
+        );
+
+        await file.create(recursive: true);
+        await file.writeAsString(jsonEncode(cachedResponse.toJson()));
+      } else {
+        // Use in-memory caching
+        _responseCache[key] = CachedResponse(
+          body: body,
+          headers: response.headers,
+          statusCode: response.statusCode,
+          cachedAt: DateTime.now(),
+          maxAge: const Duration(hours: 1),
+        );
+      }
+    } catch (e) {
+      print('Failed to save to cache: $e');
+    }
+  }
+
+  Future<CachedResponse?> _getFromCache(String key) async {
+    try {
+      // If cache directory is provided, use file system caching
+      if (cacheDirectory != null) {
+        final file = File('${cacheDirectory!.path}/$key.json');
+        if (await file.exists()) {
+          final content = await file.readAsString();
+          final json = jsonDecode(content);
+          return CachedResponse.fromJson(json);
+        }
+        return null;
+      } else {
+        // Use in-memory caching
+        return _responseCache[key];
+      }
+    } catch (e) {
+      print('Failed to read from cache: $e');
+      return null;
+    }
+  }
+
+  // Wrapper method to handle requests with caching
+  Future<shelf.Response> _handleRequestWithCaching(
+    shelf.Request req,
+    Future<shelf.Response> Function() handler,
+  ) async {
+    final cacheKey = _generateCacheKey(req);
+
+    // Try to get from cache first
+    final cachedResponse = await _getFromCache(cacheKey);
+    if (cachedResponse != null && !cachedResponse.isExpired) {
+      print('Serving from cache: $cacheKey');
+      return shelf.Response(
+        cachedResponse.statusCode,
+        body: cachedResponse.body,
+        headers: cachedResponse.headers,
+      );
     }
 
-    package.versions.sort((a, b) {
-      return semver.Version.prioritize(
-          semver.Version.parse(a.version), semver.Version.parse(b.version));
-    });
+    try {
+      // Execute the actual handler
+      final response = await handler();
 
-    var versionMaps = package.versions
-        .map((item) => _versionToJson(item, req))
-        .toList();
+      // Cache successful responses
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        // 使用 Future.microtask 替代 unawaited
+        Future.microtask(() => _saveToCache(cacheKey, response));
+      }
 
-    return _okWithJson({
-      'name': name,
-      'latest': versionMaps.last, // TODO: Exclude pre release
-      'versions': versionMaps,
+      return response;
+    } catch (error) {
+      // If we have a cached version, return it even if expired
+      if (cachedResponse != null) {
+        print('Network error, serving stale cache: $cacheKey');
+        return shelf.Response(
+          cachedResponse.statusCode,
+          body: cachedResponse.body,
+          headers: {
+            ...cachedResponse.headers,
+            'X-Unpub-Cache': 'stale',
+          },
+        );
+      }
+
+      // Re-throw if no cache available
+      rethrow;
+    }
+  }
+
+  @Route.get('/api/packages/<name>')
+  Future<shelf.Response> getVersions(shelf.Request req, String name) async {
+    return _handleRequestWithCaching(req, () async {
+      var package = await metaStore.queryPackage(name);
+
+      if (package == null) {
+        // 从上游获取包信息
+        final upstreamUri =
+            Uri.parse(upstream).resolve('/api/packages/$name').toString();
+        final client = http.Client();
+        try {
+          final response = await client.get(Uri.parse(upstreamUri));
+          if (response.statusCode == 200) {
+            // 解析上游响应
+            final data = json.decode(response.body) as Map<String, dynamic>;
+            // 提取版本信息并保存到本地数据库
+            final versions = data['versions'] as List;
+            if (versions.isNotEmpty) {
+              // 为每个版本创建 UnpubVersion 对象并添加到数据库
+              for (var versionData in versions) {
+                final pubspec = versionData['pubspec'] as Map<String, dynamic>;
+                final version = versionData['version'] as String;
+
+                // 尝试从上游数据获取创建时间，如果没有则使用当前时间
+                DateTime createdAt;
+                try {
+                  createdAt = DateTime.parse(
+                      versionData['created'] as String? ??
+                          versionData['published'] as String? ??
+                          DateTime.now().toIso8601String());
+                } catch (e) {
+                  createdAt = DateTime.now();
+                }
+
+                final unpubVersion = UnpubVersion(
+                  version,
+                  pubspec,
+                  versionData['pubspecYaml'] as String? ??
+                      "", // 尝试使用上游的pubspecYaml
+                  "", // uploader 不可用
+                  versionData['readme'] as String? ?? "", // 尝试使用上游的readme
+                  versionData['changelog'] as String? ?? "", // 尝试使用上游的changelog
+                  createdAt, // 使用解析或当前的时间
+                );
+
+                // 将版本添加到本地数据库
+                await metaStore.addVersion(name, unpubVersion);
+              }
+            }
+
+            // 返回上游的原始响应
+            return shelf.Response(
+              response.statusCode,
+              body: response.body,
+              headers: {
+                ...response.headers,
+                HttpHeaders.contentTypeHeader: ContentType.json.mimeType,
+                'Access-Control-Allow-Origin': '*',
+              },
+            );
+          } else {
+            // 如果上游请求失败，则重定向（保持原有行为）
+            return shelf.Response.found(upstreamUri);
+          }
+        } finally {
+          client.close();
+        }
+      }
+
+      package.versions.sort((a, b) {
+        return semver.Version.prioritize(
+            semver.Version.parse(a.version), semver.Version.parse(b.version));
+      });
+
+      var versionMaps =
+          package.versions.map((item) => _versionToJson(item, req)).toList();
+
+      return _okWithJson({
+        'name': name,
+        'latest': versionMaps.last, // TODO: Exclude pre release
+        'versions': versionMaps,
+      });
     });
   }
+  // @Route.get('/api/packages/<name>')
+  // Future<shelf.Response> getVersions(shelf.Request req, String name) async {
+  //   return _handleRequestWithCaching(req, () async {
+  //     var package = await metaStore.queryPackage(name);
+
+  //     if (package == null) {
+  //       return shelf.Response.found(
+  //           Uri.parse(upstream).resolve('/api/packages/$name').toString());
+  //     }
+
+  //     package.versions.sort((a, b) {
+  //       return semver.Version.prioritize(
+  //           semver.Version.parse(a.version), semver.Version.parse(b.version));
+  //     });
+
+  //     var versionMaps = package.versions
+  //         .map((item) => _versionToJson(item, req))
+  //         .toList();
+
+  //     return _okWithJson({
+  //       'name': name,
+  //       'latest': versionMaps.last, // TODO: Exclude pre release
+  //       'versions': versionMaps,
+  //     });
+  //   });
+  // }
 
   @Route.get('/api/packages/<name>/versions/<version>')
   Future<shelf.Response> getVersion(
+      shelf.Request req, String name, String version) async {
+    return _handleRequestWithCaching(req, () async {
+      // Important: + -> %2B, should be decoded here
+      try {
+        version = Uri.decodeComponent(version);
+      } catch (err) {
+        print(err);
+      }
+
+      var package = await metaStore.queryPackage(name);
+      if (package == null) {
+        return shelf.Response.found(Uri.parse(upstream)
+            .resolve('/api/packages/$name/versions/$version')
+            .toString());
+      }
+
+      var packageVersion =
+          package.versions.firstWhereOrNull((item) => item.version == version);
+      if (packageVersion == null) {
+        return shelf.Response.notFound('Not Found');
+      }
+
+      return _okWithJson(_versionToJson(packageVersion, req));
+    });
+  }
+
+  @Route.get('/packages/<name>/versions/<version>.tar.gz')
+  Future<shelf.Response> download(
       shelf.Request req, String name, String version) async {
     // Important: + -> %2B, should be decoded here
     try {
@@ -185,25 +454,8 @@ class App {
     }
 
     var package = await metaStore.queryPackage(name);
-    if (package == null) {
-      return shelf.Response.found(Uri.parse(upstream)
-          .resolve('/api/packages/$name/versions/$version')
-          .toString());
-    }
 
-    var packageVersion =
-        package.versions.firstWhereOrNull((item) => item.version == version);
-    if (packageVersion == null) {
-      return shelf.Response.notFound('Not Found');
-    }
-
-    return _okWithJson(_versionToJson(packageVersion, req));
-  }
-
-  @Route.get('/packages/<name>/versions/<version>.tar.gz')
-  Future<shelf.Response> download(
-      shelf.Request req, String name, String version) async {
-    var package = await metaStore.queryPackage(name);
+    // 如果本地没有包信息，尝试从上游获取
     if (package == null) {
       return shelf.Response.found(Uri.parse(upstream)
           .resolve('/packages/$name/versions/$version.tar.gz')
@@ -214,6 +466,41 @@ class App {
       metaStore.increaseDownloads(name, version);
     }
 
+    // 检查是否为 FileStore 并且支持缓存
+    if (packageStore is FileStore) {
+      final fileStore = packageStore as FileStore;
+
+      // 检查是否有本地缓存文件
+      bool hasCached = await fileStore.hasCachedFile(name, version);
+
+      // 如果没有缓存，则从上游下载并缓存
+      if (!hasCached) {
+        bool downloadSuccess = await fileStore.downloadAndCache(name, version);
+        // 如果下载失败且文件不存在，则尝试重定向到上游
+        if (!downloadSuccess &&
+            !(await fileStore.hasCachedFile(name, version))) {
+          final upstreamUrl = Uri.parse(upstream)
+              .resolve('/packages/$name/versions/$version.tar.gz')
+              .toString();
+          return shelf.Response.found(upstreamUrl);
+        }
+      }
+
+      // 检查文件是否存在，如果存在则返回本地文件，否则重定向到上游
+      if (await fileStore.hasCachedFile(name, version)) {
+        return shelf.Response.ok(
+          fileStore.download(name, version),
+          headers: {HttpHeaders.contentTypeHeader: ContentType.binary.mimeType},
+        );
+      } else {
+        final upstreamUrl = Uri.parse(upstream)
+            .resolve('/packages/$name/versions/$version.tar.gz')
+            .toString();
+        return shelf.Response.found(upstreamUrl);
+      }
+    }
+
+    // 非 FileStore 情况下的原有逻辑
     if (packageStore.supportsDownloadUrl) {
       return shelf.Response.found(
           await packageStore.downloadUrl(name, version));
@@ -225,11 +512,58 @@ class App {
     }
   }
 
+  // @Route.get('/packages/<name>/versions/<version>.tar.gz')
+  // Future<shelf.Response> download(
+  //     shelf.Request req, String name, String version) async {
+  //   // For binary files, we might want different caching strategy
+  //   final cacheKey = _generateCacheKey(req);
+
+  //   // Try to get from cache first
+  //   final cachedResponse = await _getFromCache(cacheKey);
+  //   if (cachedResponse != null && !cachedResponse.isExpired) {
+  //     print('Serving download from cache: $cacheKey');
+  //     return shelf.Response(
+  //       cachedResponse.statusCode,
+  //       body: cachedResponse.body,
+  //       headers: {
+  //         ...cachedResponse.headers,
+  //         HttpHeaders.contentTypeHeader: ContentType.binary.mimeType,
+  //       },
+  //     );
+  //   }
+
+  //   var package = await metaStore.queryPackage(name);
+  //   if (package == null) {
+  //     return shelf.Response.found(Uri.parse(upstream)
+  //         .resolve('/packages/$name/versions/$version.tar.gz')
+  //         .toString());
+  //   }
+
+  //   if (isPubClient(req)) {
+  //     metaStore.increaseDownloads(name, version);
+  //   }
+
+  //   shelf.Response response;
+  //   if (packageStore.supportsDownloadUrl) {
+  //     response =
+  //         shelf.Response.found(await packageStore.downloadUrl(name, version));
+  //   } else {
+  //     response = shelf.Response.ok(
+  //       packageStore.download(name, version),
+  //       headers: {HttpHeaders.contentTypeHeader: ContentType.binary.mimeType},
+  //     );
+  //   }
+
+  //   // Cache the response for future use
+  //   Future.microtask(() => _saveToCache(cacheKey, response));
+
+  //   return response;
+  // }
+
   @Route.get('/api/packages/versions/new')
   Future<shelf.Response> getUploadUrl(shelf.Request req) async {
     return _okWithJson({
-      'url': _resolveUrl(req, '/api/packages/versions/newUpload')
-          .toString(),
+      'url': _resolveUrl(req, '/api/packages/versions/newUpload').toString(),
       'fields': {},
     });
   }
@@ -237,7 +571,8 @@ class App {
   @Route.post('/api/packages/versions/newUpload')
   Future<shelf.Response> upload(shelf.Request req) async {
     try {
-      var uploader = await _getUploaderEmail(req);
+      // var uploader = await _getUploaderEmail(req);
+      var uploader = "";
 
       var contentType = req.headers['content-type'];
       if (contentType == null) throw 'invalid content type';
@@ -301,7 +636,7 @@ class App {
       // Package already exists
       if (package != null) {
         if (package.private == false) {
-          throw '$name is not a private package. Please upload it to https://pub.dev';
+          throw '$name is not a private package. Please upload it to https://pub.flutter-io.cn';
         }
 
         // Check uploaders
@@ -342,9 +677,11 @@ class App {
       await metaStore.addVersion(name, unpubVersion);
 
       // TODO: Upload docs
-      return shelf.Response.found(_resolveUrl(req, '/api/packages/versions/newUploadFinish'));
+      return shelf.Response.found(
+          _resolveUrl(req, '/api/packages/versions/newUploadFinish'));
     } catch (err) {
-      return shelf.Response.found(_resolveUrl(req, '/api/packages/versions/newUploadFinish?error=$err'));
+      return shelf.Response.found(_resolveUrl(
+          req, '/api/packages/versions/newUploadFinish?error=$err'));
     }
   }
 
@@ -361,15 +698,15 @@ class App {
   Future<shelf.Response> addUploader(shelf.Request req, String name) async {
     var body = await req.readAsString();
     var email = Uri.splitQueryString(body)['email']!; // TODO: null
-    var operatorEmail = await _getUploaderEmail(req);
-    var package = await metaStore.queryPackage(name);
+    // var operatorEmail = await _getUploaderEmail(req);
+    // var package = await metaStore.queryPackage(name);
 
-    if (package?.uploaders?.contains(operatorEmail) == false) {
-      return _badRequest('no permission', status: HttpStatus.forbidden);
-    }
-    if (package?.uploaders?.contains(email) == true) {
-      return _badRequest('email already exists');
-    }
+    // if (package?.uploaders?.contains(operatorEmail) == false) {
+    //   return _badRequest('no permission', status: HttpStatus.forbidden);
+    // }
+    // if (package?.uploaders?.contains(email) == true) {
+    //   return _badRequest('email already exists');
+    // }
 
     await metaStore.addUploader(name, email);
     return _successMessage('uploader added');
@@ -379,16 +716,16 @@ class App {
   Future<shelf.Response> removeUploader(
       shelf.Request req, String name, String email) async {
     email = Uri.decodeComponent(email);
-    var operatorEmail = await _getUploaderEmail(req);
-    var package = await metaStore.queryPackage(name);
+    // var operatorEmail = await _getUploaderEmail(req);
+    // var package = await metaStore.queryPackage(name);
 
-    // TODO: null
-    if (package?.uploaders?.contains(operatorEmail) == false) {
-      return _badRequest('no permission', status: HttpStatus.forbidden);
-    }
-    if (package?.uploaders?.contains(email) == false) {
-      return _badRequest('email not uploader');
-    }
+    // // TODO: null
+    // if (package?.uploaders?.contains(operatorEmail) == false) {
+    //   return _badRequest('no permission', status: HttpStatus.forbidden);
+    // }
+    // if (package?.uploaders?.contains(email) == false) {
+    //   return _badRequest('email not uploader');
+    // }
 
     await metaStore.removeUploader(name, email);
     return _successMessage('uploader removed');
@@ -396,128 +733,135 @@ class App {
 
   @Route.get('/webapi/packages')
   Future<shelf.Response> getPackages(shelf.Request req) async {
-    var params = req.requestedUri.queryParameters;
-    var size = int.tryParse(params['size'] ?? '') ?? 10;
-    var page = int.tryParse(params['page'] ?? '') ?? 0;
-    var sort = params['sort'] ?? 'download';
-    var q = params['q'];
+    return _handleRequestWithCaching(req, () async {
+      var params = req.requestedUri.queryParameters;
+      var size = int.tryParse(params['size'] ?? '') ?? 10;
+      var page = int.tryParse(params['page'] ?? '') ?? 0;
+      var sort = params['sort'] ?? 'download';
+      var q = params['q'];
 
-    String? keyword;
-    String? uploader;
-    String? dependency;
+      String? keyword;
+      String? uploader;
+      String? dependency;
 
-    if (q == null) {
-    } else if (q.startsWith('email:')) {
-      uploader = q.substring(6).trim();
-    } else if (q.startsWith('dependency:')) {
-      dependency = q.substring(11).trim();
-    } else {
-      keyword = q;
-    }
+      if (q == null) {
+      } else if (q.startsWith('email:')) {
+        uploader = q.substring(6).trim();
+      } else if (q.startsWith('dependency:')) {
+        dependency = q.substring(11).trim();
+      } else {
+        keyword = q;
+      }
 
-    final result = await metaStore.queryPackages(
-      size: size,
-      page: page,
-      sort: sort,
-      keyword: keyword,
-      uploader: uploader,
-      dependency: dependency,
-    );
+      final result = await metaStore.queryPackages(
+        size: size,
+        page: page,
+        sort: sort,
+        keyword: keyword,
+        uploader: uploader,
+        dependency: dependency,
+      );
 
-    var data = ListApi(result.count, [
-      for (var package in result.packages)
-        ListApiPackage(
-          package.name,
-          package.versions.last.pubspec['description'] as String?,
-          getPackageTags(package.versions.last.pubspec),
-          package.versions.last.version,
-          package.updatedAt,
-        )
-    ]);
+      var data = ListApi(result.count, [
+        for (var package in result.packages)
+          ListApiPackage(
+            package.name,
+            package.versions.last.pubspec['description'] as String?,
+            getPackageTags(package.versions.last.pubspec),
+            package.versions.last.version,
+            package.updatedAt,
+          )
+      ]);
 
-    return _okWithJson({'data': data.toJson()});
+      return _okWithJson({'data': data.toJson()});
+    });
   }
 
   @Route.get('/packages/<name>.json')
   Future<shelf.Response> getPackageVersions(
       shelf.Request req, String name) async {
-    var package = await metaStore.queryPackage(name);
-    if (package == null) {
-      return _badRequest('package not exists', status: HttpStatus.notFound);
-    }
+    return _handleRequestWithCaching(req, () async {
+      var package = await metaStore.queryPackage(name);
+      if (package == null) {
+        return _badRequest('package not exists', status: HttpStatus.notFound);
+      }
 
-    var versions = package.versions.map((v) => v.version).toList();
-    versions.sort((a, b) {
-      return semver.Version.prioritize(
-          semver.Version.parse(b), semver.Version.parse(a));
-    });
+      var versions = package.versions.map((v) => v.version).toList();
+      versions.sort((a, b) {
+        return semver.Version.prioritize(
+            semver.Version.parse(b), semver.Version.parse(a));
+      });
 
-    return _okWithJson({
-      'name': name,
-      'versions': versions,
+      return _okWithJson({
+        'name': name,
+        'versions': versions,
+      });
     });
   }
 
   @Route.get('/webapi/package/<name>/<version>')
   Future<shelf.Response> getPackageDetail(
       shelf.Request req, String name, String version) async {
-    var package = await metaStore.queryPackage(name);
-    if (package == null) {
-      return _okWithJson({'error': 'package not exists'});
-    }
+    return _handleRequestWithCaching(req, () async {
+      var package = await metaStore.queryPackage(name);
+      if (package == null) {
+        return _okWithJson({'error': 'package not exists'});
+      }
 
-    UnpubVersion? packageVersion;
-    if (version == 'latest') {
-      packageVersion = package.versions.last;
-    } else {
-      packageVersion =
-          package.versions.firstWhereOrNull((item) => item.version == version);
-    }
-    if (packageVersion == null) {
-      return _okWithJson({'error': 'version not exists'});
-    }
+      UnpubVersion? packageVersion;
+      if (version == 'latest') {
+        packageVersion = package.versions.last;
+      } else {
+        packageVersion = package.versions
+            .firstWhereOrNull((item) => item.version == version);
+      }
+      if (packageVersion == null) {
+        return _okWithJson({'error': 'version not exists'});
+      }
 
-    var versions = package.versions
-        .map((v) => DetailViewVersion(v.version, v.createdAt))
-        .toList();
-    versions.sort((a, b) {
-      return semver.Version.prioritize(
-          semver.Version.parse(b.version), semver.Version.parse(a.version));
+      var versions = package.versions
+          .map((v) => DetailViewVersion(v.version, v.createdAt))
+          .toList();
+      versions.sort((a, b) {
+        return semver.Version.prioritize(
+            semver.Version.parse(b.version), semver.Version.parse(a.version));
+      });
+
+      var pubspec = packageVersion.pubspec;
+      List<String?> authors;
+      if (pubspec['author'] != null) {
+        authors = RegExp(r'<(.*?)>')
+            .allMatches(pubspec['author'])
+            .map((match) => match.group(1))
+            .toList();
+      } else if (pubspec['authors'] != null) {
+        authors = (pubspec['authors'] as List)
+            .map((author) => RegExp(r'<(.*?)>').firstMatch(author)!.group(1))
+            .toList();
+      } else {
+        authors = [];
+      }
+
+      var depMap =
+          (pubspec['dependencies'] as Map? ?? {}).cast<String, String>();
+
+      var data = WebapiDetailView(
+        package.name,
+        packageVersion.version,
+        packageVersion.pubspec['description'] ?? '',
+        packageVersion.pubspec['homepage'] ?? '',
+        package.uploaders ?? [],
+        packageVersion.createdAt,
+        packageVersion.readme,
+        packageVersion.changelog,
+        versions,
+        authors,
+        depMap.keys.toList(),
+        getPackageTags(packageVersion.pubspec),
+      );
+
+      return _okWithJson({'data': data.toJson()});
     });
-
-    var pubspec = packageVersion.pubspec;
-    List<String?> authors;
-    if (pubspec['author'] != null) {
-      authors = RegExp(r'<(.*?)>')
-          .allMatches(pubspec['author'])
-          .map((match) => match.group(1))
-          .toList();
-    } else if (pubspec['authors'] != null) {
-      authors = (pubspec['authors'] as List)
-          .map((author) => RegExp(r'<(.*?)>').firstMatch(author)!.group(1))
-          .toList();
-    } else {
-      authors = [];
-    }
-
-    var depMap = (pubspec['dependencies'] as Map? ?? {}).cast<String, String>();
-
-    var data = WebapiDetailView(
-      package.name,
-      packageVersion.version,
-      packageVersion.pubspec['description'] ?? '',
-      packageVersion.pubspec['homepage'] ?? '',
-      package.uploaders ?? [],
-      packageVersion.createdAt,
-      packageVersion.readme,
-      packageVersion.changelog,
-      versions,
-      authors,
-      depMap.keys.toList(),
-      getPackageTags(packageVersion.pubspec),
-    );
-
-    return _okWithJson({'data': data.toJson()});
   }
 
   @Route.get('/')

@@ -26,7 +26,7 @@ class AppService {
         .toList()
         .forEach((entry) => queryParameters.remove(entry.key));
 
-    var baseUrl = isProduction ? '' : 'http://localhost:4000';
+    var baseUrl = isProduction ? '' : 'http://localhost:9090';
     var uri = Uri.parse(baseUrl).replace(
       path: path,
       queryParameters: queryParameters.map((k, v) => MapEntry(k, v.toString())),

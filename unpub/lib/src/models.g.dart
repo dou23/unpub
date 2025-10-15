@@ -13,7 +13,7 @@ UnpubVersion _$UnpubVersionFromJson(Map<String, dynamic> json) => UnpubVersion(
       json['uploader'] as String?,
       json['readme'] as String?,
       json['changelog'] as String?,
-      identity(json['createdAt'] as DateTime),
+      _dateTimeFromJson(json['createdAt']),
     );
 
 Map<String, dynamic> _$UnpubVersionToJson(UnpubVersion instance) {
@@ -32,7 +32,7 @@ Map<String, dynamic> _$UnpubVersionToJson(UnpubVersion instance) {
   writeNotNull('uploader', instance.uploader);
   writeNotNull('readme', instance.readme);
   writeNotNull('changelog', instance.changelog);
-  writeNotNull('createdAt', identity(instance.createdAt));
+  writeNotNull('createdAt', _dateTimeToJson(instance.createdAt));
   return val;
 }
 
@@ -43,8 +43,8 @@ UnpubPackage _$UnpubPackageFromJson(Map<String, dynamic> json) => UnpubPackage(
           .toList(),
       json['private'] as bool,
       (json['uploaders'] as List<dynamic>?)?.map((e) => e as String).toList(),
-      identity(json['createdAt'] as DateTime),
-      identity(json['updatedAt'] as DateTime),
+      _dateTimeFromJson(json['createdAt']),
+      _dateTimeFromJson(json['updatedAt']),
       json['download'] as int?,
     );
 
@@ -54,8 +54,8 @@ Map<String, dynamic> _$UnpubPackageToJson(UnpubPackage instance) =>
       'versions': instance.versions,
       'private': instance.private,
       'uploaders': instance.uploaders,
-      'createdAt': identity(instance.createdAt),
-      'updatedAt': identity(instance.updatedAt),
+      'createdAt': _dateTimeToJson(instance.createdAt),
+      'updatedAt': _dateTimeToJson(instance.updatedAt),
       'download': instance.download,
     };
 
