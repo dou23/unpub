@@ -1,4 +1,6 @@
-# Unpub
+# 魔改版Unpub
+
+代理pub.dev请求，然后会把请求的数据缓存到本地，然后再返回响应，之后请求当本地有缓存时就优先返回缓存了。支持离线部署（端口9090）。
 
 [![pub](https://img.shields.io/pub/v/unpub.svg)](https://pub.dev/packages/unpub)
 
