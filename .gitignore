@@ -8,3 +8,8 @@
 # pubspec.lock
 */pubspec.lock
 */unpub-packages
+
+*.exe
+*.zip
+bin/unpub-linux.exe
+bin/unpub-windows.exe

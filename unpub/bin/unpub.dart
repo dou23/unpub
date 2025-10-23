@@ -9,6 +9,7 @@ main(List<String> args) async {
   var parser = ArgParser();
   parser.addOption('host', abbr: 'h', defaultsTo: '0.0.0.0');
   parser.addOption('port', abbr: 'p', defaultsTo: '9090');
+  parser.addOption('cache_path', abbr: 'c', defaultsTo: '');
   parser.addOption('database',
       abbr: 'd', defaultsTo: 'mongodb://localhost:27017/dart_pub');
   parser.addOption('proxy-origin', abbr: 'o', defaultsTo: '');
@@ -28,7 +29,13 @@ main(List<String> args) async {
 
   // final db = Db(dbUri);
   // await db.open();
-  var baseDir = path.absolute('unpub-packages');
+  var cachePath = results['cache_path'] as String;
+  var baseDir;
+  if (cachePath.isNotEmpty) {
+    baseDir = cachePath;
+  } else {
+    baseDir = path.absolute('unpub-packages');
+  }
   // var dbStore = unpub.MongoStore(db);
   final db = await databaseFactoryIo.openDatabase(
     path.join('.dart_tool', 'sembast', 'unpub.db'),
@@ -36,11 +43,11 @@ main(List<String> args) async {
   var dbStore = unpub.SembastStore(db);
   // var dbStore = unpub.SqliteStore(baseDir);
   var app = unpub.App(
-      metaStore: dbStore,
-      packageStore: unpub.FileStore(baseDir),
-      proxy_origin:
-          proxy_origin.trim().isEmpty ? null : Uri.parse(proxy_origin),
-          cacheDirectory: Directory('./cache'),);
+    metaStore: dbStore,
+    packageStore: unpub.FileStore(baseDir),
+    proxy_origin: proxy_origin.trim().isEmpty ? null : Uri.parse(proxy_origin),
+    cacheDirectory: Directory(baseDir + '/unpub_cache'),
+  );
 
   var server = await app.serve(host, port);
   print('Serving at http://${server.address.host}:${server.port}');
