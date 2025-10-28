@@ -9,6 +9,7 @@ main(List<String> args) async {
   var parser = ArgParser();
   parser.addOption('host', abbr: 'h', defaultsTo: '0.0.0.0');
   parser.addOption('port', abbr: 'p', defaultsTo: '9090');
+  parser.addOption('upstreamUrl', abbr: 'u', defaultsTo: 'https://mirrors.tuna.tsinghua.edu.cn/dart-pub/');
   parser.addOption('cache_path', abbr: 'c', defaultsTo: '');
   parser.addOption('database',
       abbr: 'd', defaultsTo: 'mongodb://localhost:27017/dart_pub');
@@ -20,6 +21,7 @@ main(List<String> args) async {
   var port = int.parse(results['port'] as String);
   var dbUri = results['database'] as String;
   var proxy_origin = results['proxy-origin'] as String;
+  var upstreamUrl = results['upstreamUrl'] as String;
 
   if (results.rest.isNotEmpty) {
     print('Got unexpected arguments: "${results.rest.join(' ')}".\n\nUsage:\n');
@@ -38,13 +40,14 @@ main(List<String> args) async {
   }
   // var dbStore = unpub.MongoStore(db);
   final db = await databaseFactoryIo.openDatabase(
-    path.join('.dart_tool', 'sembast', 'unpub.db'),
+    path.join(baseDir,'.db', 'sembast', 'unpub.db'),
   );
   var dbStore = unpub.SembastStore(db);
   // var dbStore = unpub.SqliteStore(baseDir);
   var app = unpub.App(
     metaStore: dbStore,
-    packageStore: unpub.FileStore(baseDir),
+    packageStore: unpub.FileStore(baseDir, upstream: upstreamUrl),
+    upstream: upstreamUrl,
     proxy_origin: proxy_origin.trim().isEmpty ? null : Uri.parse(proxy_origin),
     cacheDirectory: Directory(baseDir + '/unpub_cache'),
   );
